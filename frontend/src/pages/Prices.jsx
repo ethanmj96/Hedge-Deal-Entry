@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { Table, InputNumber, Select, Button, Upload, Modal, message, Row, Col, DatePicker, Tag, Space } from 'antd';
-import { UploadOutlined, DownloadOutlined } from '@ant-design/icons';
+import { UploadOutlined, DownloadOutlined, FilePdfOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 
 const API = 'http://localhost:8000';
@@ -14,7 +14,9 @@ export default function Prices() {
   const [priceType, setPriceType] = useState('Settled');
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadingPdf, setUploadingPdf] = useState(false);
   const fileInputRef = useRef(null);
+  const pdfInputRef = useRef(null);
 
   const fetchPrices = () => {
     fetch(`${API}/prices`)
@@ -123,6 +125,32 @@ export default function Prices() {
     e.target.value = '';
   };
 
+  const handlePdfUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingPdf(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch(`${API}/prices/upload-ice-pdf`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        message.success(`${data.product}: ${data.message} (${data.count} prices)`);
+        fetchPrices();
+      } else {
+        const err = await res.json();
+        message.error('PDF upload failed: ' + (err.detail || 'Unknown error'));
+      }
+    } catch {
+      message.error('Error uploading PDF');
+    }
+    setUploadingPdf(false);
+    e.target.value = '';
+  };
+
   const uniqueValues = (field) =>
     [...new Set(prices.map((d) => d[field]).filter(Boolean))].map((v) => ({
       text: v,
@@ -224,12 +252,27 @@ export default function Prices() {
             <Button size="small" icon={<DownloadOutlined />} onClick={downloadCsv} disabled={prices.length === 0}>
               Download
             </Button>
+            <Button
+              size="small"
+              icon={<FilePdfOutlined />}
+              loading={uploadingPdf}
+              onClick={() => pdfInputRef.current?.click()}
+            >
+              ICE PDF
+            </Button>
             <input
               type="file"
               ref={fileInputRef}
               accept=".csv"
               style={{ display: 'none' }}
               onChange={handleBulkUpload}
+            />
+            <input
+              type="file"
+              ref={pdfInputRef}
+              accept=".pdf"
+              style={{ display: 'none' }}
+              onChange={handlePdfUpload}
             />
           </Space>
         </Col>

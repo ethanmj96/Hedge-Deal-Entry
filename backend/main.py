@@ -1,10 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import date
 from pathlib import Path
 from calendar import monthrange
 import openpyxl
+import pdfplumber
+import re
+import io
 
 app = FastAPI(title="Deal Entry API")
 
@@ -308,6 +311,103 @@ def bulk_upload_prices(entries: list[PriceEntry]):
             count_added += 1
     wb.save(EXCEL_FILE)
     return {"message": f"{count_added} added, {count_updated} updated"}
+
+
+# --- ICE PDF Upload ---
+
+# Map ICE commodity codes to our product names
+ICE_CODE_TO_PRODUCT = {
+    "TFM": "TTF",
+}
+
+MONTH_ABBR = {
+    "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
+    "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
+    "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
+}
+
+
+def parse_ice_contract_month(contract_month: str) -> str | None:
+    """Convert ICE format like 'Apr26' to 'YYYY-MM' format like '2026-04'."""
+    match = re.match(r"([A-Za-z]{3})(\d{2})", contract_month)
+    if not match:
+        return None
+    abbr, year_short = match.group(1), match.group(2)
+    month_num = MONTH_ABBR.get(abbr)
+    if not month_num:
+        return None
+    year = f"20{year_short}"
+    return f"{year}-{month_num}"
+
+
+@app.post("/prices/upload-ice-pdf")
+async def upload_ice_pdf(file: UploadFile = File(...)):
+    """Parse an ICE end-of-day PDF report and save forward prices."""
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+
+    contents = await file.read()
+    pdf = pdfplumber.open(io.BytesIO(contents))
+
+    entries = []
+    for page in pdf.pages:
+        tables = page.extract_tables()
+        for table in tables:
+            for row in table:
+                if not row or not row[0]:
+                    continue
+                code = row[0].strip()
+                if code not in ICE_CODE_TO_PRODUCT:
+                    continue
+                product = ICE_CODE_TO_PRODUCT[code]
+                # Column 1 = contract month, Column 6 = settle price
+                contract_month = (row[1] or "").strip()
+                settle_price = (row[6] or "").strip()
+                if not contract_month or not settle_price:
+                    continue
+                month = parse_ice_contract_month(contract_month)
+                if not month:
+                    continue
+                try:
+                    price_val = float(settle_price.replace(",", ""))
+                except ValueError:
+                    continue
+                entries.append(PriceEntry(
+                    product=product,
+                    month=month,
+                    price=price_val,
+                    type="Forward",
+                ))
+
+    pdf.close()
+
+    if not entries:
+        raise HTTPException(status_code=400, detail="No prices found in PDF")
+
+    # Bulk save using existing logic
+    wb = get_or_create_workbook()
+    ws = wb["Prices"]
+    existing = {}
+    for row in ws.iter_rows(min_row=2, values_only=False):
+        key = (row[0].value, row[1].value, row[3].value if len(row) >= 4 else None)
+        existing[key] = row
+    count_updated = 0
+    count_added = 0
+    for entry in entries:
+        key = (entry.product, entry.month, entry.type)
+        if key in existing:
+            existing[key][2].value = entry.price
+            count_updated += 1
+        else:
+            ws.append([entry.product, entry.month, entry.price, entry.type])
+            count_added += 1
+    wb.save(EXCEL_FILE)
+
+    return {
+        "message": f"{count_added} added, {count_updated} updated",
+        "product": entries[0].product if entries else None,
+        "count": len(entries),
+    }
 
 
 # --- Settlements ---
