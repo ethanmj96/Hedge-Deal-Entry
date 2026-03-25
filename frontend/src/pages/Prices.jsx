@@ -12,6 +12,7 @@ export default function Prices() {
   const [month, setMonth] = useState(null);
   const [price, setPrice] = useState(null);
   const [priceType, setPriceType] = useState('Settled');
+  const [priceDate, setPriceDate] = useState(dayjs());
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadingPdf, setUploadingPdf] = useState(false);
@@ -42,6 +43,7 @@ export default function Prices() {
           month: month.format('YYYY-MM'),
           price,
           type: priceType,
+          date: priceDate.format('YYYY-MM-DD'),
         }),
       });
       if (res.ok) {
@@ -65,8 +67,9 @@ export default function Prices() {
       return;
     }
     const monthStr = month.format('YYYY-MM');
+    const dateStr = priceDate.format('YYYY-MM-DD');
     const existing = prices.find(
-      (p) => p.Product === product && p.Month === monthStr && p.Type === priceType
+      (p) => p.Product === product && p.Month === monthStr && p.Type === priceType && p.Date === dateStr
     );
     if (existing) {
       Modal.confirm({
@@ -99,6 +102,7 @@ export default function Prices() {
           month: cols[1],
           price: parseFloat(cols[2]),
           type: cols[3],
+          date: cols[4] || null,
         });
       }
       if (entries.length === 0) {
@@ -138,7 +142,7 @@ export default function Prices() {
       });
       if (res.ok) {
         const data = await res.json();
-        message.success(`${data.product}: ${data.message} (${data.count} prices)`);
+        message.success(`${data.product}: ${data.message} (${data.count} prices, date: ${data.date})`);
         fetchPrices();
       } else {
         const err = await res.json();
@@ -166,13 +170,16 @@ export default function Prices() {
       onFilter: (val, record) => record['Type'] === val,
       render: (val) => <Tag color={val === 'Settled' ? 'green' : 'blue'}>{val || 'N/A'}</Tag>
     },
+    { title: 'Date', dataIndex: 'Date', key: 'date', filters: uniqueValues('Date'), onFilter: (val, record) => record['Date'] === val,
+      sorter: (a, b) => (a.Date || '').localeCompare(b.Date || ''),
+    },
   ];
 
   const makeOptions = (list) => list?.map((v) => ({ label: v, value: v })) || [];
 
   const downloadCsv = () => {
-    const header = 'Product,Month,Price,Type';
-    const rows = prices.map((p) => `${p.Product},${p.Month},${p.Price},${p.Type || ''}`);
+    const header = 'Product,Month,Price,Type,Date';
+    const rows = prices.map((p) => `${p.Product},${p.Month},${p.Price},${p.Type || ''},${p.Date || ''}`);
     const csv = [header, ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
@@ -237,6 +244,15 @@ export default function Prices() {
           />
         </Col>
         <Col>
+          <label style={labelStyle}>Date</label>
+          <DatePicker
+            value={priceDate}
+            onChange={(d) => setPriceDate(d || dayjs())}
+            style={{ width: 130 }}
+            size="small"
+          />
+        </Col>
+        <Col>
           <Space size={4}>
             <Button type="primary" size="small" onClick={handleSave} loading={saving}>
               Save
@@ -278,7 +294,7 @@ export default function Prices() {
         </Col>
       </Row>
       <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: 16 }}>
-        CSV format: Product, Month (YYYY-MM), Price, Type (Settled/Forward)
+        CSV format: Product, Month (YYYY-MM), Price, Type (Settled/Forward), Date (YYYY-MM-DD, optional)
       </p>
 
       <Table

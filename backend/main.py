@@ -18,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-EXCEL_FILE = Path(__file__).parent / "deals.xlsx"
+EXCEL_FILE = Path(__file__).parent / "data.xlsx"
 
 COLUMNS = [
     "Trade ID", "Trade Date", "Start Date", "End Date", "Counterparty", "Direction",
@@ -86,7 +86,7 @@ class Deal(BaseModel):
     end_date: date
 
 
-PRICE_COLUMNS = ["Product", "Month", "Price", "Type"]
+PRICE_COLUMNS = ["Product", "Month", "Price", "Type", "Date"]
 
 
 def migrate_sheet(ws, expected_columns):
@@ -257,6 +257,7 @@ class PriceEntry(BaseModel):
     month: str  # "YYYY-MM"
     price: float
     type: str  # "Settled" or "Forward"
+    date: str | None = None  # "YYYY-MM-DD", defaults to today
 
 
 @app.get("/prices")
@@ -275,17 +276,22 @@ def get_prices():
 def set_price(entry: PriceEntry):
     wb = get_or_create_workbook()
     ws = wb["Prices"]
-    # Update existing match on product + month + type, or add new
+    entry_date = entry.date or str(date.today())
+    # Update existing match on product + month + type + date, or add new
     for row in ws.iter_rows(min_row=2, values_only=False):
+        row_date = row[4].value if len(row) >= 5 else None
         if (row[0].value == entry.product
                 and row[1].value == entry.month
-                and (len(row) < 4 or row[3].value is None or row[3].value == entry.type)):
+                and (len(row) < 4 or row[3].value is None or row[3].value == entry.type)
+                and (row_date == entry_date)):
             row[2].value = entry.price
             if len(row) >= 4:
                 row[3].value = entry.type
+            if len(row) >= 5:
+                row[4].value = entry_date
             wb.save(EXCEL_FILE)
             return {"message": "Updated", "product": entry.product, "month": entry.month}
-    ws.append([entry.product, entry.month, entry.price, entry.type])
+    ws.append([entry.product, entry.month, entry.price, entry.type, entry_date])
     wb.save(EXCEL_FILE)
     return {"message": "Saved", "product": entry.product, "month": entry.month}
 
@@ -294,20 +300,24 @@ def set_price(entry: PriceEntry):
 def bulk_upload_prices(entries: list[PriceEntry]):
     wb = get_or_create_workbook()
     ws = wb["Prices"]
+    today = str(date.today())
     # Build index of existing rows for fast lookup
     existing = {}
     for row in ws.iter_rows(min_row=2, values_only=False):
-        key = (row[0].value, row[1].value, row[3].value if len(row) >= 4 else None)
+        key = (row[0].value, row[1].value,
+               row[3].value if len(row) >= 4 else None,
+               row[4].value if len(row) >= 5 else None)
         existing[key] = row
     count_updated = 0
     count_added = 0
     for entry in entries:
-        key = (entry.product, entry.month, entry.type)
+        entry_date = entry.date or today
+        key = (entry.product, entry.month, entry.type, entry_date)
         if key in existing:
             existing[key][2].value = entry.price
             count_updated += 1
         else:
-            ws.append([entry.product, entry.month, entry.price, entry.type])
+            ws.append([entry.product, entry.month, entry.price, entry.type, entry_date])
             count_added += 1
     wb.save(EXCEL_FILE)
     return {"message": f"{count_added} added, {count_updated} updated"}
@@ -340,6 +350,27 @@ def parse_ice_contract_month(contract_month: str) -> str | None:
     return f"{year}-{month_num}"
 
 
+def extract_ice_pdf_date(pdf) -> str | None:
+    """Try to extract the trade/report date from an ICE PDF header text."""
+    first_page = pdf.pages[0] if pdf.pages else None
+    if not first_page:
+        return None
+    text = first_page.extract_text() or ""
+    # Look for patterns like "20-Mar-2026", "March 20, 2026", "2026-03-20", "20 Mar 2026"
+    # ICE reports typically use "DD-Mon-YYYY" or "DD Mon YYYY"
+    m = re.search(r"(\d{1,2})[-\s](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-\s](\d{4})", text)
+    if m:
+        day, mon_abbr, year = m.group(1), m.group(2), m.group(3)
+        month_num = MONTH_ABBR.get(mon_abbr)
+        if month_num:
+            return f"{year}-{month_num}-{int(day):02d}"
+    # Try ISO format YYYY-MM-DD
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+    if m:
+        return m.group(1)
+    return None
+
+
 @app.post("/prices/upload-ice-pdf")
 async def upload_ice_pdf(file: UploadFile = File(...)):
     """Parse an ICE end-of-day PDF report and save forward prices."""
@@ -348,6 +379,9 @@ async def upload_ice_pdf(file: UploadFile = File(...)):
 
     contents = await file.read()
     pdf = pdfplumber.open(io.BytesIO(contents))
+
+    # Extract the report date from the PDF, fall back to today
+    pdf_date = extract_ice_pdf_date(pdf) or str(date.today())
 
     entries = []
     for page in pdf.pages:
@@ -377,6 +411,7 @@ async def upload_ice_pdf(file: UploadFile = File(...)):
                     month=month,
                     price=price_val,
                     type="Forward",
+                    date=pdf_date,
                 ))
 
     pdf.close()
@@ -389,17 +424,19 @@ async def upload_ice_pdf(file: UploadFile = File(...)):
     ws = wb["Prices"]
     existing = {}
     for row in ws.iter_rows(min_row=2, values_only=False):
-        key = (row[0].value, row[1].value, row[3].value if len(row) >= 4 else None)
+        key = (row[0].value, row[1].value,
+               row[3].value if len(row) >= 4 else None,
+               row[4].value if len(row) >= 5 else None)
         existing[key] = row
     count_updated = 0
     count_added = 0
     for entry in entries:
-        key = (entry.product, entry.month, entry.type)
+        key = (entry.product, entry.month, entry.type, entry.date)
         if key in existing:
             existing[key][2].value = entry.price
             count_updated += 1
         else:
-            ws.append([entry.product, entry.month, entry.price, entry.type])
+            ws.append([entry.product, entry.month, entry.price, entry.type, entry.date])
             count_added += 1
     wb.save(EXCEL_FILE)
 
@@ -407,6 +444,7 @@ async def upload_ice_pdf(file: UploadFile = File(...)):
         "message": f"{count_added} added, {count_updated} updated",
         "product": entries[0].product if entries else None,
         "count": len(entries),
+        "date": pdf_date,
     }
 
 
@@ -423,13 +461,20 @@ def calculate_settlements(month: str):
     wb = get_or_create_workbook()
 
     # Load settled prices into a dict (only Type = "Settled")
+    # When multiple dates exist, use the latest date's price
     ws_sp = wb["Prices"]
     settled = {}
+    settled_dates = {}
     for row in ws_sp.iter_rows(min_row=2, values_only=True):
         if row[0] and row[1]:
             price_type = row[3] if len(row) >= 4 else None
+            row_date = row[4] if len(row) >= 5 else None
             if price_type == "Settled" or price_type is None:
-                settled[(row[0], row[1])] = row[2]
+                key = (row[0], row[1])
+                prev_date = settled_dates.get(key)
+                if prev_date is None or (row_date or "") >= (prev_date or ""):
+                    settled[key] = row[2]
+                    settled_dates[key] = row_date
 
     # Load deals active in this month
     ws_deals = wb["Deals"]
